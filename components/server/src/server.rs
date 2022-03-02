@@ -38,12 +38,12 @@ use file_system::{
     get_io_rate_limiter, set_io_rate_limiter, BytesFetcher, File, IOBudgetAdjustor,
     MetricsManager as IOMetricsManager,
 };
-use futures::executor::block_on;
+use futures::{executor::block_on, StreamExt};
 use grpcio::{EnvBuilder, Environment};
 use kvproto::{
     brpb::create_backup, cdcpb::create_change_data, deadlock::create_deadlock,
     debugpb::create_debug, diagnosticspb::create_diagnostics, import_sstpb::create_import_sst,
-    resource_usage_agent::create_resource_metering_pub_sub,
+    pdpb::GlobalConfigItem, resource_usage_agent::create_resource_metering_pub_sub,
 };
 use pd_client::{PdClient, RpcClient};
 use raft_log_engine::RaftLogEngine;
@@ -77,6 +77,7 @@ use tikv::{
         gc_worker::{AutoGcConfig, GcWorker},
         lock_manager::LockManager,
         resolve,
+        server::GLOBAL_CONFIG_SYNCER_THREAD_PREFIX,
         service::{DebugService, DiagnosticsService},
         status_server::StatusServer,
         ttl::TTLChecker,
@@ -96,7 +97,10 @@ use tikv_util::{
     time::{Instant, Monitor},
     worker::{Builder as WorkerBuilder, LazyWorker, Worker},
 };
-use tokio::runtime::Builder;
+use tokio::{
+    runtime::{Builder, Runtime},
+    time::sleep,
+};
 
 use crate::raft_engine_switch::{check_and_dump_raft_db, check_and_dump_raft_engine};
 use crate::{memory::*, setup::*, signal_handler};
@@ -168,6 +172,7 @@ const DEFAULT_STORAGE_STATS_INTERVAL: Duration = Duration::from_secs(1);
 /// A complete TiKV server.
 struct TiKVServer<ER: RaftEngine> {
     config: TiKvConfig,
+    global_cfg_rt: Runtime,
     cfg_controller: Option<ConfigController>,
     security_mgr: Arc<SecurityManager>,
     pd_client: Arc<RpcClient>,
@@ -230,11 +235,77 @@ impl<ER: RaftEngine> TiKVServer<ER> {
         let pd_client =
             Self::connect_to_pd_cluster(&mut config, env.clone(), Arc::clone(&security_mgr));
 
+        let global_cfg_rt = Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name(GLOBAL_CONFIG_SYNCER_THREAD_PREFIX)
+            .enable_all()
+            .build()
+            .unwrap();
+
         // Initialize and check config
         let cfg_controller = Self::init_config(config);
         let config = cfg_controller.get_current();
 
         let store_path = Path::new(&config.storage.data_dir).to_owned();
+
+        // listen global config
+        let global_config_pd_client = pd_client.clone();
+        let global_cfg_controller = cfg_controller.clone();
+        global_cfg_rt.spawn(async move {
+            loop {
+                match global_config_pd_client.watch_global_config() {
+                    Ok(mut global_cfg_receiver) => {
+                        info!("start global config syncer");
+                        loop {
+                            if let Some(cfg) = global_cfg_receiver.next().await {
+                                match cfg {
+                                    Ok(cfg) => {
+                                        cfg.get_changes().iter().for_each(
+                                            |GlobalConfigItem {
+                                                 name, value, error, ..
+                                             }| {
+                                                if error.is_some() {
+                                                    error!(
+                                                        "error when get global config: {:?}",
+                                                        error.clone().into_option().unwrap()
+                                                    );
+                                                } else {
+                                                    info!(
+                                                        "global config changed: {} = {}",
+                                                        name, value
+                                                    );
+                                                    // TODO: maybe create method update global config?
+                                                    match global_cfg_controller.update_config(&name.split('/').collect::<Vec<&str>>()[3], value) {
+                                                        Ok(_) => {
+                                                            info!("update global config success: {} = {}", name, value);
+                                                        }
+                                                        Err(e) => {
+                                                            error!("update global config failed: {:?}", e);
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                        );
+                                    }
+                                    Err(e) => {
+                                        error!("failed to get global config: {:?}", e);
+                                    }
+                                }
+                            } else {
+                                sleep(Duration::from_millis(300)).await;
+                                continue;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("failed to start global config controller: {}", e);
+                        error!("retry after 300ms");
+                    }
+                }
+                // TODO: retry interval
+                sleep(Duration::from_millis(300)).await;
+            }
+        });
 
         // Initialize raftstore channels.
         let (router, system) = fsm::create_raft_batch_system(&config.raft_store);
@@ -259,6 +330,7 @@ impl<ER: RaftEngine> TiKVServer<ER> {
         TiKVServer {
             config,
             cfg_controller: Some(cfg_controller),
+            global_cfg_rt,
             security_mgr,
             pd_client,
             router,

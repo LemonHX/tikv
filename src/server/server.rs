@@ -45,6 +45,7 @@ const MEMORY_USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 pub const GRPC_THREAD_PREFIX: &str = "grpc-server";
 pub const READPOOL_NORMAL_THREAD_PREFIX: &str = "store-read-norm";
 pub const STATS_THREAD_PREFIX: &str = "transport-stats";
+pub const GLOBAL_CONFIG_SYNCER_THREAD_PREFIX : &str = "global-config-syncer";
 
 /// The TiKV server
 ///
